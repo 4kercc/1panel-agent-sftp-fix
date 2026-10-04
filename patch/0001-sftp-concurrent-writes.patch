@@ -1,0 +1,58 @@
+From c5876d96a58e7b8d653d6dbb779f744828052a1d Mon Sep 17 00:00:00 2001
+From: 4kercc <13767585+4kercc@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 13:48:14 +0800
+Subject: [PATCH] fix: speed up SFTP backup upload with concurrent writes
+
+The SFTP uploader used io.Copy(dstFile, srcFile). Since the source is an
+*os.File it implements io.WriterTo, so io.Copy took the os.File.WriteTo
+branch and issued one synchronous SFTP WRITE per packet, waiting for the
+server reply every time. Throughput was therefore bounded by packetSize/RTT
+instead of the link capacity: on a ~68ms RTT link a 440MB backup reached
+only ~0.25 MB/s, while rclone / OpenSSH sftp reach 16-19 MB/s on the very
+same link and target.
+
+pkg/sftp already provides a pipelined write path (File.ReadFrom, enabled by
+UseConcurrentWrites and bounded by MaxConcurrentRequestsPerFile, default 64).
+Use it for uploads, and truncate the remote file to the number of bytes
+actually written when the concurrent write fails, to avoid leaving holes.
+
+Measured against the same 68ms RTT target: a 96MiB upload went from 6m40s
+(~0.25 MB/s) to ~6s (~16 MB/s); a 950MB three-site backup job from ~2h40m to
+~2m04s.
+---
+ agent/utils/cloud_storage/client/sftp.go | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/agent/utils/cloud_storage/client/sftp.go b/agent/utils/cloud_storage/client/sftp.go
+index c3a79dc5..eb494fe4 100644
+--- a/agent/utils/cloud_storage/client/sftp.go
++++ b/agent/utils/cloud_storage/client/sftp.go
+@@ -97,7 +97,7 @@ func (s sftpClient) Upload(ctx context.Context, src, target string) (bool, error
+ 	}()
+ 	defer close(done)
+ 
+-	client, err := sftp.NewClient(sshClient)
++	client, err := sftp.NewClient(sshClient, sftp.UseConcurrentWrites(true))
+ 	if err != nil {
+ 		return false, err
+ 	}
+@@ -127,7 +127,15 @@ func (s sftpClient) Upload(ctx context.Context, src, target string) (bool, error
+ 	}
+ 	defer dstFile.Close()
+ 
+-	if _, err := io.Copy(dstFile, srcFile); err != nil {
++	// ReadFrom uses the pipelined write path of pkg/sftp. A plain io.Copy would
++	// pick os.File.WriteTo (the source is an *os.File), which issues one
++	// synchronous SFTP WRITE per packet and waits for the reply every time, so
++	// the throughput is bounded by packetSize/RTT.
++	written, err := dstFile.ReadFrom(srcFile)
++	if err != nil {
++		// A failed concurrent write may leave holes in the remote file, so cut
++		// it back to the number of bytes actually written.
++		_ = dstFile.Truncate(written)
+ 		if ctxErr := ctx.Err(); ctxErr != nil {
+ 			return false, ctxErr
+ 		}
+-- 
+2.55.0.windows.5
+
